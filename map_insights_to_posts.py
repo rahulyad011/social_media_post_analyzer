@@ -2,8 +2,9 @@
 map_insights_to_posts.py
 ========================
 Maps each insight to the top-N most relevant social media posts using:
-  1. Sentence embeddings (local)  — fast semantic similarity across all posts
-  2. LLM API (Anthropic or OpenAI) — scores and extracts exact excerpts from top candidates
+  1. Bi-encoder (local)           — fast semantic similarity across all posts
+  2. CrossEncoder reranking (opt) — more precise reranking of top candidates (config.yaml)
+  3. LLM API (Anthropic or OpenAI) — scores and extracts exact excerpts from top candidates
 
 Configuration : config.yaml
 Secrets       : .env  (LLM_PROVIDER, ANTHROPIC_API_KEY, OPENAI_API_KEY)
@@ -83,9 +84,23 @@ cfg = load_config()
 # Convenience aliases so the rest of the code stays readable
 COL_I  = cfg.columns.insights   # insight column names
 COL_P  = cfg.columns.posts      # post column names
-TUNE   = cfg.tuning
-MODELS = cfg.models
-FILES  = cfg.files
+TUNE    = cfg.tuning
+FILES   = cfg.files
+MATCH   = cfg.matching
+
+
+class _Models:
+    """
+    Model names — env vars take priority over config.yaml defaults.
+      ANTHROPIC_MODEL  (default: models.anthropic in config.yaml)
+      OPENAI_MODEL     (default: models.openai    in config.yaml)
+    """
+    anthropic: str = os.getenv("ANTHROPIC_MODEL", cfg.models.anthropic)
+    openai:    str = os.getenv("OPENAI_MODEL",    cfg.models.openai)
+    embedding: str = cfg.models.embedding
+
+
+MODELS = _Models()
 
 # Ordered list of insight columns written to output
 ALL_INSIGHT_COLS = (
@@ -119,11 +134,20 @@ def validate():
         sys.exit(1)
     log.debug(f"{key_name} loaded (length={len(key)})")
 
-    for path in (FILES.insights, FILES.posts):
+    for path in (FILES.base, FILES.target):
         if not os.path.exists(path):
             log.error(f"Required file not found: {path}")
             sys.exit(1)
         log.debug(f"File found: {path}")
+
+    log.info(f"Base file        : {FILES.base}   match column: '{MATCH.base_col}'")
+    log.info(f"Target file      : {FILES.target}  match column: '{MATCH.target_col}'")
+
+    ce = cfg.cross_encoder
+    if ce.enabled:
+        log.info(f"CrossEncoder     : ENABLED  model={ce.model}  top_k_retrieve={ce.top_k_retrieve}")
+    else:
+        log.info("CrossEncoder     : disabled")
 
     log.info(
         f"top_n={TUNE.top_n}  top_k_for_llm={TUNE.top_k_for_llm}  "
@@ -154,8 +178,8 @@ def build_client(provider: str):
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     log.info("Loading data...")
 
-    insights_df = pd.read_excel(FILES.insights, dtype={COL_I.num: str})
-    posts_df    = pd.read_excel(FILES.posts,    dtype={COL_P.id:  str})
+    insights_df = pd.read_excel(FILES.base,   dtype={COL_I.num: str})
+    posts_df    = pd.read_excel(FILES.target, dtype={COL_P.id:  str})
 
     log.debug(f"Insights columns  : {list(insights_df.columns)}")
     log.debug(f"Posts columns     : {list(posts_df.columns)}")
@@ -198,15 +222,15 @@ def embed_all(
     posts_df: pd.DataFrame,
 ) -> tuple[np.ndarray, np.ndarray]:
 
-    log.info("Embedding posts (local, no API)...")
+    log.info(f"Embedding target posts — column: '{MATCH.target_col}'")
     post_embeddings = model.encode(
-        posts_df[COL_P.text].tolist(), batch_size=64, show_progress_bar=True
+        posts_df[MATCH.target_col].tolist(), batch_size=64, show_progress_bar=True
     )
     log.debug(f"Post embeddings shape   : {post_embeddings.shape}")
 
-    log.info("Embedding insights...")
+    log.info(f"Embedding base insights — column: '{MATCH.base_col}'")
     insight_embeddings = model.encode(
-        insights_df[COL_I.text].tolist(), batch_size=64, show_progress_bar=False
+        insights_df[MATCH.base_col].tolist(), batch_size=64, show_progress_bar=False
     )
     log.debug(f"Insight embeddings shape: {insight_embeddings.shape}")
 
@@ -221,8 +245,13 @@ def find_top_candidates(
     post_embeddings: np.ndarray,
     posts_df: pd.DataFrame,
 ) -> list[dict]:
-    """Return up to top_k_for_llm posts above min_similarity, sorted by similarity desc."""
-    sims        = cosine_similarity([insight_embedding], post_embeddings)[0]
+    """
+    Return bi-encoder candidates above min_similarity, sorted by similarity desc.
+    Fetch limit: top_k_retrieve (CrossEncoder on) or top_k_for_llm (CrossEncoder off).
+    """
+    ce        = cfg.cross_encoder
+    fetch_k   = ce.top_k_retrieve if ce.enabled else TUNE.top_k_for_llm
+    sims      = cosine_similarity([insight_embedding], post_embeddings)[0]
     top_indices = np.argsort(sims)[::-1]
 
     candidates = []
@@ -237,10 +266,13 @@ def find_top_candidates(
             "author_type":  posts_df.iloc[idx][COL_P.author_type],
             "similarity":   round(sim, 4),
         })
-        if len(candidates) >= TUNE.top_k_for_llm:
+        if len(candidates) >= fetch_k:
             break
 
-    log.debug(f"  Vector retrieval: {len(candidates)} candidates (threshold={TUNE.min_similarity})")
+    log.debug(
+        f"  Bi-encoder retrieval: {len(candidates)} candidates"
+        f"  (fetch_k={fetch_k}, threshold={TUNE.min_similarity})"
+    )
     for c in candidates:
         log.debug(
             f"    [{c['post_id']}] sim={c['similarity']:.4f}  author={c['author_type']}"
@@ -248,6 +280,37 @@ def find_top_candidates(
         )
 
     return candidates
+
+
+# ──────────────────────────────────────────────────────────────
+# Step 3b — CrossEncoder reranking (optional)
+# ──────────────────────────────────────────────────────────────
+
+def rerank_with_cross_encoder(
+    cross_encoder,
+    insight_text: str,
+    candidates: list[dict],
+) -> list[dict]:
+    """
+    Rerank candidates using the CrossEncoder, return top top_k_for_llm by CE score.
+    Adds 'ce_score' to each candidate dict for debug visibility.
+    """
+    pairs  = [(insight_text, c["post_text"]) for c in candidates]
+    scores = cross_encoder.predict(pairs)
+
+    for c, score in zip(candidates, scores):
+        c["ce_score"] = float(score)
+
+    reranked = sorted(candidates, key=lambda x: x["ce_score"], reverse=True)
+
+    log.debug(f"  CrossEncoder reranked {len(reranked)} → keeping top {TUNE.top_k_for_llm}")
+    for c in reranked[: TUNE.top_k_for_llm]:
+        log.debug(
+            f"    [{c['post_id']}] ce_score={c['ce_score']:.4f}  sim={c['similarity']:.4f}"
+            f"  author={c['author_type']}"
+        )
+
+    return reranked[: TUNE.top_k_for_llm]
 
 # ──────────────────────────────────────────────────────────────
 # Step 4 — LLM scoring and excerpt extraction
@@ -406,6 +469,7 @@ def map_insights(
     posts_df: pd.DataFrame,
     insight_embeddings: np.ndarray,
     post_embeddings: np.ndarray,
+    cross_encoder=None,
 ) -> list[dict]:
 
     n_total  = len(insights_df)
@@ -418,11 +482,18 @@ def map_insights(
 
         log.info(f"[{pos + 1}/{n_total}] Insight #{insight_num}: {insight_text[:80]}...")
 
+        # Stage 1 — bi-encoder retrieval
         candidates = find_top_candidates(insight_embeddings[pos], post_embeddings, posts_df)
-        log.info(f"  Vector candidates : {len(candidates)}")
+        log.info(f"  Bi-encoder candidates  : {len(candidates)}")
 
+        # Stage 2 — CrossEncoder reranking (optional)
+        if cross_encoder is not None and candidates:
+            candidates = rerank_with_cross_encoder(cross_encoder, insight_text, candidates)
+            log.info(f"  After CE reranking     : {len(candidates)}")
+
+        # Stage 3 — LLM scoring + excerpt extraction
         top_posts = extract_excerpts(client, provider, insight_text, candidates)
-        log.info(f"  Final matches     : {len(top_posts)} (score >= {TUNE.min_score})")
+        log.info(f"  Final matches          : {len(top_posts)} (score >= {TUNE.min_score})")
 
         if not top_posts:
             no_match += 1
@@ -570,14 +641,26 @@ if __name__ == "__main__":
 
     insights_df, posts_df = load_data()
 
-    log.info(f"Loading embedding model ({MODELS.embedding})...")
+    log.info(f"Loading bi-encoder ({MODELS.embedding})...")
     embed_model = SentenceTransformer(MODELS.embedding)
-    log.debug("Embedding model ready")
+    log.debug("Bi-encoder ready")
 
     insight_embeddings, post_embeddings = embed_all(embed_model, insights_df, posts_df)
 
+    # Load CrossEncoder only if enabled
+    cross_encoder = None
+    if cfg.cross_encoder.enabled:
+        from sentence_transformers import CrossEncoder
+        log.info(f"Loading CrossEncoder ({cfg.cross_encoder.model})...")
+        cross_encoder = CrossEncoder(cfg.cross_encoder.model)
+        log.debug("CrossEncoder ready")
+
     client = build_client(provider)
 
-    results = map_insights(client, provider, insights_df, posts_df, insight_embeddings, post_embeddings)
+    results = map_insights(
+        client, provider, insights_df, posts_df,
+        insight_embeddings, post_embeddings,
+        cross_encoder=cross_encoder,
+    )
 
     write_output(insights_df, results)

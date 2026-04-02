@@ -4,9 +4,16 @@
 # ──────────────────────────────────────────────────────────────
 
 files:
-  insights: data/insights.xlsx
-  posts:    data/posts.xlsx
-  output:   data/insights_mapped.xlsx
+  base:   data/insights.xlsx   # source file containing insights (rows to map from)
+  target: data/posts.xlsx      # source file containing posts   (rows to map to)
+  output: data/insights_mapped.xlsx
+
+# ── Which columns are used for semantic matching ──────────────
+# These must be valid column names in the respective files.
+# They drive both the bi-encoder embedding and the CrossEncoder comparison.
+matching:
+  base_col:   Insights          # column from base file  (insights) to embed
+  target_col: post              # column from target file (posts)   to embed
 
 # ── Column names in the Excel files ──────────────────────────
 columns:
@@ -45,9 +52,20 @@ tuning:
 
 # ── Model identifiers ─────────────────────────────────────────
 models:
-  embedding: all-MiniLM-L6-v2
+  embedding: all-mpnet-base-v2
   anthropic: claude-haiku-4-5-20251001
   openai:    gpt-4o-mini
+
+# ── Optional CrossEncoder reranking stage ─────────────────────
+# Pipeline when enabled:
+#   bi-encoder retrieves top_k_retrieve candidates
+#   → CrossEncoder reranks → top top_k_for_llm passed to LLM
+# Pipeline when disabled:
+#   bi-encoder retrieves top_k_for_llm candidates directly
+cross_encoder:
+  enabled:        false
+  model:          cross-encoder/ms-marco-MiniLM-L-6-v2
+  top_k_retrieve: 50   # how many bi-encoder candidates to fetch before reranking
 
 # ── Excel output formatting ───────────────────────────────────
 excel:
