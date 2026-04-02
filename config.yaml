@@ -1,0 +1,77 @@
+# ──────────────────────────────────────────────────────────────
+# config.yaml — all non-secret configuration for the mapper
+# Secrets (API keys, LLM_PROVIDER) stay in .env
+# ──────────────────────────────────────────────────────────────
+
+files:
+  insights: data/insights.xlsx
+  posts:    data/posts.xlsx
+  output:   data/insights_mapped.xlsx
+
+# ── Column names in the Excel files ──────────────────────────
+columns:
+  insights:
+    num:      "#"
+    slide:    "Slide #"
+    priority: Priority
+    category: Category
+    text:     Insights
+    stages:
+      - "Stage 1: Not Yet in the AD Pathway"
+      - "Stage 2: PCP / Community Health Assessment"
+      - "Stage 3: Specialist AD Assessment"
+      - "Stage 4: DMT Eligibility Assessment"
+      - "Stage 5: DMT Treatment & Monitoring"
+      - "Stage 6: Disease Management & Monitoring"
+    stakeholders:
+      - Patient
+      - Clinician
+      - Payer
+      - Provider
+      - Societal
+  posts:
+    id:          lsc_id
+    text:        post
+    summary:     analysis_summary
+    author_type: author_type
+
+# ── Retrieval / scoring thresholds ───────────────────────────
+tuning:
+  top_n:          5      # max posts per insight kept in output
+  top_k_for_llm:  10     # candidates sent to LLM per insight
+  min_similarity: 0.2   # cosine similarity floor (vector stage)
+  min_score:      5     # LLM relevance score floor (0–10)
+  llm_sleep_sec:  1      # pause between LLM calls (rate-limit buffer)
+
+# ── Model identifiers ─────────────────────────────────────────
+models:
+  embedding: all-MiniLM-L6-v2
+  anthropic: claude-haiku-4-5-20251001
+  openai:    gpt-4o-mini
+
+# ── Excel output formatting ───────────────────────────────────
+excel:
+  colors:
+    header:      "1F4E79"
+    insight:     "D6E4F0"
+    stage:       "E8D5F5"
+    stakeholder: "FAE5D3"
+    post_even:   "EAF4E8"
+    post_odd:    "FFF8E7"
+  column_widths:
+    insight_text: 55
+    stage:        10
+    stakeholder:  12
+    num_slide:     8
+    priority:     12
+    category:     20
+    post_excerpt: 50
+    post_summary: 35
+    post_author:  16
+    post_id:      14
+    post_score:   12
+    default:      18
+  row_heights:
+    header: 35
+    data:   70
+  freeze_pane: "E2"

@@ -1,0 +1,9 @@
+anthropic
+openai
+pandas
+openpyxl
+sentence-transformers
+scikit-learn
+numpy
+python-dotenv
+pyyaml
