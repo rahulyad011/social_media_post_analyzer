@@ -8,3 +8,5 @@ numpy
 python-dotenv
 pyyaml
 streamlit
+torch
+torchvision
